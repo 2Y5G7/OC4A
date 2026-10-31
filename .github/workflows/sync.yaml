@@ -1,0 +1,42 @@
+name: Sync orange-cloud android
+
+on:
+  schedule:
+    - cron: '0 2 * * *'   # 每天 UTC 02:00(北京时间 10:00)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout 当前仓库
+        uses: actions/checkout@v4
+
+      - name: 拉取上游 apps/android
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/chen2he/orange-cloud.git /tmp/upstream
+          cd /tmp/upstream
+          git sparse-checkout set apps/android
+
+      - name: 镜像到仓库根目录
+        run: |
+          rsync -a --delete \
+            --exclude='/.git/' \
+            --exclude='/.github/' \
+            /tmp/upstream/apps/android/ ./
+
+      - name: 提交并推送变更
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "没有变更,跳过提交"
+          else
+            git commit -m "chore: sync apps/android from chen2he/orange-cloud"
+            git push
+          fi
