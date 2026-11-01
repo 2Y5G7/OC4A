@@ -1,0 +1,53 @@
+name: Build APK
+
+on:
+  workflow_dispatch:            # 手动触发
+  workflow_run:                 # 同步工作流完成后自动构建(不需要可删掉这段)
+    workflows: ["Sync orange-cloud android"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    env:
+      KS: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}   # 可选:固定签名
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: 准备 Android SDK
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: 写入 local.properties
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          echo "OAUTH_CLIENT_ID=${{ secrets.OAUTH_CLIENT_ID }}" >> local.properties
+
+      - name: 还原固定签名(配置了 DEBUG_KEYSTORE_BASE64 才执行)
+        if: env.KS != ''
+        run: |
+          mkdir -p ~/.android
+          echo "$KS" | base64 -d > ~/.android/debug.keystore
+
+      - name: 构建 oss debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleOssDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orange-cloud-oss-apk
+          path: app/build/outputs/apk/oss/debug/*.apk
