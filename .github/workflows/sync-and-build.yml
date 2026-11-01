@@ -1,0 +1,252 @@
+name: Sync and Build APK
+
+# 每天同步上游 chen2he/orange-cloud 的 apps/android 到仓库根目录,
+# 上游有新提交(或手动触发)时构建 oss release APK,用 OrangeCloud 签名后发布 Release。
+
+on:
+  schedule:
+    - cron: '0 2 * * *'     # 每天 UTC 02:00(北京时间 10:00)
+  workflow_dispatch:         # 手动触发:同步后一定构建,并覆盖重发 Release
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-and-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: chen2he/orange-cloud
+  UPSTREAM_PATH: apps/android
+  SCOPES_PATH: apps/android/app/src/main/kotlin/jiamin/chen/orangecloud/core/auth/Scopes.kt
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      build: ${{ steps.gate.outputs.build }}
+      up_sha: ${{ steps.gate.outputs.up_sha }}
+    steps:
+      - name: Checkout 当前仓库
+        uses: actions/checkout@v4
+
+      - name: 拉取上游 apps/android
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            "https://github.com/${UPSTREAM}.git" /tmp/upstream
+          git -C /tmp/upstream sparse-checkout set "${UPSTREAM_PATH}"
+          if [ ! -f "/tmp/upstream/${UPSTREAM_PATH}/gradlew" ]; then
+            echo "::error::上游 ${UPSTREAM_PATH} 下没有找到 gradlew,目录结构可能变了"
+            exit 1
+          fi
+
+      - name: 镜像到仓库根目录
+        run: |
+          rsync -a --delete \
+            --exclude='/.git/' \
+            --exclude='/.github/' \
+            "/tmp/upstream/${UPSTREAM_PATH}/" ./
+
+      - name: 提交并推送变更
+        id: commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "没有变更,跳过提交"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "chore: sync ${UPSTREAM_PATH} from ${UPSTREAM}"
+            git push
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 是否需要构建:手动触发一定构建;自动触发时,若最新 Release 里没有记录当前上游提交就构建。
+      # 这样即使某天构建失败,第二天仍会自动重试,不会因为"没有新变更"而一直跳过。
+      - name: 判断是否需要构建
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANGED: ${{ steps.commit.outputs.changed }}
+        run: |
+          UP_SHA=$(gh api "repos/${UPSTREAM}/commits?path=${UPSTREAM_PATH}&per_page=1" --jq '.[0].sha' 2>/dev/null || true)
+          [ "$UP_SHA" = "null" ] && UP_SHA=""
+          echo "up_sha=${UP_SHA}" >> "$GITHUB_OUTPUT"
+          echo "上游 ${UPSTREAM_PATH} 最新提交: ${UP_SHA:-未知}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "手动触发,执行构建"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$UP_SHA" ]; then
+            echo "无法获取上游提交,按是否有同步变更决定: changed=${CHANGED}"
+            echo "build=${CHANGED}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          LAST_TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || true)
+          if [ -n "$LAST_TAG" ] && gh release view "$LAST_TAG" --json body --jq '.body' 2>/dev/null | grep -qF "$UP_SHA"; then
+            echo "最新 Release ${LAST_TAG} 已对应该提交,跳过构建"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "最新 Release 尚未对应该提交,执行构建"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      UP_SHA: ${{ needs.sync.outputs.up_sha }}
+    steps:
+      - name: Checkout 同步后的最新代码
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-36 build-tools;36.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: 写入 local.properties
+        env:
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+        run: |
+          {
+            echo "sdk.dir=${ANDROID_HOME}"
+            echo "OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}"
+          } > local.properties
+
+      - name: 替换回调地址为自己的中转
+        env:
+          REDIRECT: ${{ secrets.OAUTH_REDIRECT_URI }}
+        run: |
+          if [ -z "$REDIRECT" ]; then
+            echo "::error::Secret OAUTH_REDIRECT_URI 为空"; exit 1
+          fi
+          # 转义 sed 替换串里的特殊字符
+          ESC=$(printf '%s' "$REDIRECT" | sed -e 's/[\\&#]/\\&/g')
+          grep -rlE "https://(o-c\.do|orange-cloud\.chatiro\.app)/oauth/callback" app/src \
+            | xargs -r sed -i -E "s#https://(o-c\.do|orange-cloud\.chatiro\.app)/oauth/callback#${ESC}#g"
+          echo "--- 代码中与回调相关的位置 ---"
+          grep -rnE "oauth/callback|o-c\.do|chatiro" app/src app/build.gradle.kts || true
+          if ! grep -rqF "$REDIRECT" app/src; then
+            echo "::error::源码里没有找到你的回调地址,替换规则没有命中,为避免发布无法登录的版本,构建中止"
+            exit 1
+          fi
+
+      - name: 构建 oss release APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleOssRelease --stacktrace
+
+      - name: 对齐并签名
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          UNSIGNED=$(ls app/build/outputs/apk/oss/release/*.apk | head -n1)
+          echo "待签名文件: $UNSIGNED"
+
+          VERSION=$("$BT/aapt2" dump badging "$UNSIGNED" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -n1)
+          if [ -z "$VERSION" ]; then
+            echo "::error::没有读取到 versionName"; exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "APK_NAME=OrangeCloud-oss-v${VERSION}.apk" >> "$GITHUB_ENV"
+
+          "$BT/zipalign" -p -f 4 "$UNSIGNED" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign \
+            --ks "$RUNNER_TEMP/release.jks" \
+            --ks-pass env:KS_PASS \
+            --ks-key-alias "$KEY_ALIAS" \
+            --key-pass env:KEY_PASS \
+            --out "OrangeCloud-oss-v${VERSION}.apk" \
+            "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --print-certs "OrangeCloud-oss-v${VERSION}.apk"
+
+      - name: 清理签名文件
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.jks" "$RUNNER_TEMP/aligned.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OrangeCloud-oss-v${{ env.VERSION }}
+          path: ${{ env.APK_NAME }}
+          retention-days: 14        # 长期保存的副本在 Release 里
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${VERSION}"
+          NOTES="$RUNNER_TEMP/notes.md"
+
+          # 查询上游 Scopes.kt 最近一次提交
+          OK=0
+          SHA=$(gh api "repos/${UPSTREAM}/commits?path=${SCOPES_PATH}&per_page=1" --jq '.[0].sha' 2>/dev/null || true)
+          if [ -n "$SHA" ] && [ "$SHA" != "null" ] \
+             && gh api "repos/${UPSTREAM}/commits/${SHA}" > "$RUNNER_TEMP/commit.json" 2>/dev/null; then
+            OK=1
+          fi
+
+          {
+            echo "版本号:v${VERSION}"
+            if [ -n "$UP_SHA" ]; then
+              echo
+              echo "上游 ${UPSTREAM_PATH} 提交:${UP_SHA}"
+            fi
+            echo
+            echo "## Scopes.kt 最近一次更新"
+            echo
+            if [ "$OK" = "1" ]; then
+              DATE=$(jq -r '.commit.committer.date' "$RUNNER_TEMP/commit.json")
+              MSG=$(jq -r '.commit.message' "$RUNNER_TEMP/commit.json" | head -n1)
+              URL=$(jq -r '.html_url' "$RUNNER_TEMP/commit.json")
+              LOCAL=$(TZ=Asia/Shanghai date -d "$DATE" '+%Y-%m-%d %H:%M')
+              echo "- 更新时间:${LOCAL}(UTC+8)"
+              echo "- 提交说明:${MSG}"
+              echo "- 提交:[${SHA:0:7}](${URL})"
+              echo
+              echo "### 变化"
+              echo
+              PATCH=$(jq -r --arg p "$SCOPES_PATH" '.files[] | select(.filename==$p) | .patch // empty' "$RUNNER_TEMP/commit.json")
+              if [ -n "$PATCH" ]; then
+                echo '```diff'
+                echo "$PATCH" | head -n 80
+                echo '```'
+              else
+                echo "(该提交中没有可显示的文件差异)"
+              fi
+            else
+              echo "(未能获取上游 Scopes.kt 的提交信息)"
+            fi
+          } > "$NOTES"
+
+          # 已有同版本 Release 则先删除(连同标签),再重新发布
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "删除旧的 Release ${TAG} 及其标签"
+            gh release delete "$TAG" --cleanup-tag --yes
+          fi
+
+          gh release create "$TAG" "$APK_NAME" \
+            --target "$(git rev-parse HEAD)" \
+            --title "Orange Cloud OSS v${VERSION}" \
+            --notes-file "$NOTES"
